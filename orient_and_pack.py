@@ -70,23 +70,6 @@ def _overhang_score(mesh):
     return float(areas[overhanging].sum())
 
 
-def _sphere_fibonacci(n):
-    """
-    Generate n approximately uniformly distributed points on the unit sphere
-    using the Fibonacci / golden-angle method.
-    Each point represents a candidate 'down' direction to probe.
-    """
-    golden = (1.0 + np.sqrt(5.0)) / 2.0
-    i      = np.arange(n, dtype=float)
-    theta  = 2.0 * np.pi * i / golden
-    phi    = np.arccos(1.0 - 2.0 * (i + 0.5) / n)
-    return np.column_stack([
-        np.sin(phi) * np.cos(theta),
-        np.sin(phi) * np.sin(theta),
-        np.cos(phi),
-    ])
-
-
 def _cluster_normals(mesh, bin_size=0.05):
     """
     Group face normals by direction (binned to bin_size resolution) and
@@ -132,67 +115,72 @@ def _rotation_matrix_to_neg_z(src):
     ])
 
 
-def _score_candidate(normals, face_z_min, areas, R):
+def _score_candidate(normals, face_verts_flat, areas, R, total_area):
     """
-    Compute overhang score for rotation R without copying or mutating the mesh.
-    Rotates only the normals and face z-mins in numpy — fast for large meshes.
+    Composite score for a candidate orientation R:
+      overhang_fraction  — fraction of surface area that needs support
+                           (PrusaSlicer 50° threshold)
+      stability_penalty  — penalises tall, narrow orientations that are hard
+                           to print and would need a lot of support to stay up.
+
+    Both terms are normalised so neither dominates for extreme geometries.
+    Lower score = better orientation.
     """
-    rot_normals  = normals @ R.T                    # (N, 3)
-    rot_z_min    = face_z_min @ R[2]                # approximate: project face z-min onto new Z axis
-    z_floor      = rot_z_min.min()
-    overhanging  = (rot_normals[:, 2] < -0.643) & (rot_z_min > z_floor + 0.1)
-    return float(areas[overhanging].sum())
+    rot_normals = normals @ R.T                             # (N, 3)
+
+    # Project all vertices onto new Z axis to find per-face z-min
+    proj_z     = face_verts_flat @ R[2]                     # (N*3,)
+    face_z_min = proj_z.reshape(-1, 3).min(axis=1)          # (N,)
+    z_floor    = face_z_min.min()
+    z_ceil     = proj_z.max()
+    height     = max(z_ceil - z_floor, 1e-6)
+
+    # Footprint area: XY bounding box of all rotated vertices
+    proj_x      = face_verts_flat @ R[0]
+    proj_y      = face_verts_flat @ R[1]
+    footprint   = max((proj_x.max() - proj_x.min()) * (proj_y.max() - proj_y.min()), 1e-6)
+
+    overhanging = (rot_normals[:, 2] < -0.643) & (face_z_min > z_floor + 0.1)
+    overhang_fraction = float(areas[overhanging].sum()) / total_area
+
+    # Stability: height / sqrt(footprint). A flat slab scores ~0; a thin wall scores high.
+    stability_penalty = height / (footprint ** 0.5)
+
+    return overhang_fraction + 0.4 * stability_penalty
 
 
 def orient_largest_face_down(mesh):
     """
     Accurate support-minimising orientation search combining three strategies:
 
-    1. Spherical Fibonacci (100 pts) — uniform global coverage so no good
-       orientation is missed regardless of mesh topology.
-    2. Coplanar-cluster candidates (top 20 by total flat-region area) — finds
-       flat regions made of many small coplanar triangles correctly.
-    3. Six OBB axis-aligned orientations — always tries the six obvious sides.
+    1. Coplanar-cluster candidates (top 30 by total flat-region area) — only
+       uses actual face normals so the part always sits flat, no floating.
+    2. Six OBB axis-aligned orientations — always tries the six obvious sides.
 
     Scoring uses the PrusaSlicer 50° overhang threshold without mesh.copy(),
     so it stays fast even on high-polygon parts.
     """
-    normals    = mesh.face_normals.copy()       # (N, 3)
-    areas      = mesh.area_faces.copy()         # (N,)
-    face_verts = mesh.vertices[mesh.faces]      # (N, 3, 3)
-    # Per-face minimum vertex position — used to detect faces on the build plate
-    face_pts   = face_verts.reshape(-1, 3)      # (N*3, 3)  for fast projection
+    normals         = mesh.face_normals.copy()
+    areas           = mesh.area_faces.copy()
+    total_area      = float(areas.sum())
+    face_verts_flat = mesh.vertices[mesh.faces].reshape(-1, 3)  # (N*3, 3)
 
-    # Build candidate pool
-    sphere_pts = list(_sphere_fibonacci(100))
-    clustered  = _cluster_normals(mesh)[:20]
+    # Candidates: actual face normals only — guarantees part sits flat on bed
+    clustered = _cluster_normals(mesh)[:30]
     try:
         rot_mat  = mesh.bounding_box_oriented.primitive.transform[:3, :3]
         obb_axes = [rot_mat[:, i] * s for i in range(3) for s in (1, -1)]
     except Exception:
         obb_axes = []
 
-    candidates = [np.asarray(c, dtype=float) for c in sphere_pts + clustered + obb_axes]
-
-    # Precompute per-face min-vertex z-coordinate in a fast vectorisable form.
-    # We approximate by keeping the raw vertex array and projecting per candidate.
-    face_verts_flat = face_pts                  # (N*3, 3)
+    candidates = [np.asarray(c, dtype=float) for c in clustered + obb_axes]
 
     best_score  = float('inf')
     best_normal = candidates[0].copy()
 
     for cand in candidates:
-        R = _rotation_matrix_to_neg_z(cand)
-
-        rot_normals = normals @ R.T                         # (N, 3)
-        # Project all vertices onto new Z axis, reshape to (N, 3), take min per face
-        proj_z      = face_verts_flat @ R[2]                # (N*3,)
-        face_z_min  = proj_z.reshape(-1, 3).min(axis=1)    # (N,)
-        z_floor     = face_z_min.min()
-
-        overhanging = (rot_normals[:, 2] < -0.643) & (face_z_min > z_floor + 0.1)
-        score = float(areas[overhanging].sum())
-
+        R     = _rotation_matrix_to_neg_z(cand)
+        score = _score_candidate(normals, face_verts_flat, areas, R, total_area)
         if score < best_score:
             best_score  = score
             best_normal = cand.copy()
