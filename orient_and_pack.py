@@ -52,13 +52,47 @@ def orient_vertical(mesh):
     mesh.apply_translation([0, 0, -mesh.bounds[0][2]])
 
 
-def orient_largest_face_down(mesh):
-    """Place the largest flat face on the build plate — minimises overhangs."""
-    idx    = int(np.argmax(mesh.area_faces))
-    normal = mesh.face_normals[idx].copy()
+def _overhang_score(mesh):
+    """
+    Total area of faces whose normal points more than 45° below horizontal
+    AND whose lowest vertex is above the build plate (i.e. needs support).
+    Lower is better.
+    """
+    normals   = mesh.face_normals                          # (N, 3)
+    areas     = mesh.area_faces                            # (N,)
+    z_floor   = float(mesh.bounds[0][2])
+    face_verts = mesh.vertices[mesh.faces]                 # (N, 3, 3)
+    face_z_min = face_verts[:, :, 2].min(axis=1)           # (N,)
 
-    # We want that face's outward normal pointing DOWN (-Z)
-    _apply_rotation_to_align(mesh, normal, [0, 0, -1])
+    overhanging = (normals[:, 2] < -0.5) & (face_z_min > z_floor + 0.1)
+    return float(areas[overhanging].sum())
+
+
+def orient_largest_face_down(mesh):
+    """
+    Try the N largest faces as the bottom surface and keep whichever rotation
+    produces the least total overhang area — true support minimisation.
+    """
+    CANDIDATES = 12
+    areas   = mesh.area_faces
+    normals = mesh.face_normals
+
+    top_idx = np.argsort(areas)[-CANDIDATES:][::-1]
+
+    best_score  = float('inf')
+    best_normal = normals[top_idx[0]].copy()
+
+    for idx in top_idx:
+        candidate_normal = normals[idx].copy()
+        probe = mesh.copy()
+        _apply_rotation_to_align(probe, candidate_normal, [0, 0, -1])
+        probe.apply_translation([0, 0, -probe.bounds[0][2]])
+        score = _overhang_score(probe)
+        if score < best_score:
+            best_score  = score
+            best_normal = candidate_normal
+
+    _apply_rotation_to_align(mesh, best_normal, [0, 0, -1])
     mesh.apply_translation([0, 0, -mesh.bounds[0][2]])
 
 
@@ -97,57 +131,84 @@ def footprint(mesh):
     return (b[1][0] - b[0][0]), (b[1][1] - b[0][1])   # (width, depth)
 
 
+def try_rotate(mesh):
+    """Rotate 90° in XY and return new footprint — does not mutate mesh."""
+    w, d = footprint(mesh)
+    return d, w  # swapped
+
+
 def pack(parts):
     """
     Pack list of (name, mesh) onto as many plates as needed.
+    Uses a shelf algorithm with a deferred-retry pass so parts that are too
+    tall for the current shelf gap can be skipped and placed later if a
+    shorter remaining space fits them.
     Returns list of plates; each plate is [(name, mesh, x_offset, y_offset)].
-    Tries both XY orientations of each part and picks whichever fits first.
     """
     # Largest footprint first
-    parts_sorted = sorted(parts, key=lambda p: footprint(p[1])[0] * footprint(p[1])[1], reverse=True)
+    remaining = sorted(parts, key=lambda p: footprint(p[1])[0] * footprint(p[1])[1], reverse=True)
 
-    plates     = []
-    shelf_x    = 0.0
-    shelf_y    = 0.0
-    shelf_h    = 0.0
-    cur_plate  = []
+    plates = []
 
-    def flush_plate():
-        nonlocal shelf_x, shelf_y, shelf_h, cur_plate
-        if cur_plate:
-            plates.append(cur_plate)
-        cur_plate = []
-        shelf_x   = 0.0
-        shelf_y   = 0.0
-        shelf_h   = 0.0
+    while remaining:
+        cur_plate  = []
+        shelf_x    = 0.0
+        shelf_y    = 0.0
+        shelf_h    = 0.0
+        unplaced   = []
 
-    for name, mesh in parts_sorted:
-        w, d = footprint(mesh)
-
-        # If the part is wider than the bed, try rotating 90° in XY
-        if w > BED_X and d <= BED_X:
-            mesh.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [0, 0, 1]))
+        for name, mesh in remaining:
             w, d = footprint(mesh)
 
-        if w > BED_X or d > BED_Y:
-            print(f"  WARNING: '{name}' ({w:.1f}x{d:.1f} mm) exceeds bed size — skipped")
-            continue
+            # Try XY rotation if it helps fit
+            rw, rd = try_rotate(mesh)
+            use_rotated = False
+            if w > BED_X and rw <= BED_X:
+                use_rotated = True
+                w, d = rw, rd
 
-        # New shelf needed?
-        if shelf_x + w > BED_X:
-            shelf_y += shelf_h + GAP
-            shelf_x  = 0.0
-            shelf_h  = 0.0
+            if w > BED_X or d > BED_Y:
+                print(f"  WARNING: '{name}' ({w:.1f}x{d:.1f} mm) exceeds bed size — skipped")
+                continue
 
-        # New plate needed?
-        if shelf_y + d > BED_Y:
-            flush_plate()
+            placed = False
 
-        cur_plate.append((name, mesh, shelf_x, shelf_y))
-        shelf_x += w + GAP
-        shelf_h  = max(shelf_h, d)
+            # Try current shelf position
+            if shelf_x + w <= BED_X and shelf_y + d <= BED_Y:
+                pass  # falls through to place below
+            elif shelf_x + w > BED_X:
+                # Try a new shelf
+                new_shelf_y = shelf_y + shelf_h + GAP
+                if new_shelf_y + d <= BED_Y:
+                    shelf_y = new_shelf_y
+                    shelf_x = 0.0
+                    shelf_h = 0.0
+                else:
+                    unplaced.append((name, mesh))
+                    continue
+            else:
+                unplaced.append((name, mesh))
+                continue
 
-    flush_plate()
+            if use_rotated:
+                mesh.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [0, 0, 1]))
+                # Re-centre XY after rotation
+                b = mesh.bounds
+                mesh.apply_translation([
+                    -0.5 * (b[0][0] + b[1][0]),
+                    -0.5 * (b[0][1] + b[1][1]),
+                    0
+                ])
+                w, d = footprint(mesh)
+
+            cur_plate.append((name, mesh, shelf_x, shelf_y))
+            shelf_x += w + GAP
+            shelf_h  = max(shelf_h, d)
+
+        if cur_plate:
+            plates.append(cur_plate)
+        remaining = unplaced
+
     return plates
 
 
