@@ -157,7 +157,13 @@ root    = Path("/Users/rabiaakhtar/Downloads/cat")
 out_dir = root / "plates"
 out_dir.mkdir(exist_ok=True)
 
-stl_files = sorted(p for p in root.rglob("*.stl") if "plates" not in str(p))
+EXCLUDE = {'front_w_letters'} | {f'letter-{i}-' for i in range(1, 10)}
+
+stl_files = sorted(
+    p for p in root.rglob("*.stl")
+    if "plates" not in str(p)
+    and not any(p.stem == ex or p.stem.startswith(ex) for ex in EXCLUDE)
+)
 print(f"Found {len(stl_files)} STL files\n")
 
 parts = []
