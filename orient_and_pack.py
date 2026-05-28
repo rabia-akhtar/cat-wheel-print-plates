@@ -11,7 +11,7 @@ from pathlib import Path
 
 BED_X = 245   # usable width  (250mm - 5mm margin)
 BED_Y = 205   # usable depth  (210mm - 5mm margin)
-GAP   = 3     # mm gap between parts
+GAP   = 8     # mm gap between parts — enough for build plate supports
 
 
 # ── Orientation helpers ───────────────────────────────────────────────────────
